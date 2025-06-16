@@ -1,17 +1,20 @@
 
 # dummy_aws_base_hook.py
-# Place this in your Composer environment under /dags/plugins/
+# DO NOT place inside any subfolders under /plugins
 
 import sys
 import types
 
-# Create dummy module path
-aws_module = types.ModuleType("airflow.providers.amazon.aws.hooks.base_aws")
-sys.modules["airflow.providers.amazon.aws.hooks.base_aws"] = aws_module
+DUMMY_MODULE = "airflow.providers.amazon.aws.hooks.base_aws"
 
-# Define dummy AwsBaseHook
-class AwsBaseHook:
-    def __init__(self, *args, **kwargs):
-        pass
+# If module is not already mocked, inject it
+if DUMMY_MODULE not in sys.modules:
+    dummy_module = types.ModuleType(DUMMY_MODULE)
 
-aws_module.AwsBaseHook = AwsBaseHook
+    class AwsBaseHook:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    dummy_module.AwsBaseHook = AwsBaseHook
+
+    sys.modules[DUMMY_MODULE] = dummy_module
