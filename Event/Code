@@ -1,0 +1,15 @@
+resource "google_storage_notification" "notify_pubsub_on_object_finalize" {
+  bucket         = google_storage_bucket.gdw1_sandbox_corp_gdw_sfr_cdb8.name
+  topic          = "projects/sandbox-corp-gdw-sfr-cdb8/topics/sandbox-pbs-gdw-0213646-01-sts"
+  payload_format = "JSON_API_V1"
+  event_types    = ["OBJECT_FINALIZE"]
+
+  depends_on = [google_storage_bucket.gdw1_sandbox_corp_gdw_sfr_cdb8]
+}
+
+resource "google_pubsub_topic_iam_member" "storage_pub_permission" {
+  project = "sandbox-corp-gdw-sfr-cdb8"
+  topic   = "sandbox-pbs-gdw-0213646-01-sts"
+  role    = "roles/pubsub.publisher"
+  member  = "serviceAccount:service-870078270208@gs-project-accounts.iam.gserviceaccount.com"
+}
