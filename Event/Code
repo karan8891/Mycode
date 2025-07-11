@@ -1,58 +1,46 @@
-import functions_framework
-import requests
-import google.auth
-import google.auth.transport.requests
-import os
-import json
+from airflow import models
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+from airflow.utils.dates import days_ago
 
-@functions_framework.cloud_event
-def main(cloud_event):
-    # Step 1: Get env vars
-    dag_id = "gdw_to_apmf_push_dag"  # Change as needed
-    composer_env_url = os.environ.get("COMPOSER_WEBSERVER_URL")  # NEW VAR!
-    project_id = os.environ.get("PROJECT_ID", "")
-    
-    if not composer_env_url:
-        print("COMPOSER_WEBSERVER_URL env variable not found.")
-        return
+BUCKET_NAME = "gdw1_sandbox-corp-gdw-sfr-cdb8"
+SOURCE_PREFIX = "gb_files/"
+DESTINATION_FILE = "gb_files/merged/merged_output.txt"
 
-    # Step 2: Extract GCS bucket event
-    data = cloud_event.data
-    bucket = data.get("bucket")
-    name = data.get("name")
+def concatenate_files_gcs(bucket_name, source_prefix, destination_blob):
+    hook = GCSHook()
+    client = hook.get_conn()
+    bucket = client.bucket(bucket_name)
 
-    if not name:
-        print("No object name in event.")
-        return
+    # List all blobs with the prefix
+    blobs = list(client.list_blobs(bucket_name, prefix=source_prefix))
+    contents = []
 
-    print(f"Received file {name} in bucket {bucket} -> triggering DAG: {dag_id}")
+    for blob in blobs:
+        if blob.name.endswith(".txt") and not blob.name.endswith(destination_blob):
+            content = blob.download_as_bytes()
+            contents.append(content)
 
-    # Step 3: Prepare Airflow trigger endpoint
-    endpoint = f"{composer_env_url}/api/v1/dags/{dag_id}/dagRuns"
-    
-    # Step 4: Auth token
-    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-    auth_req = google.auth.transport.requests.Request()
-    credentials.refresh(auth_req)
-    token = credentials.token
+    # Write to destination blob
+    final_blob = bucket.blob(destination_blob)
+    final_blob.upload_from_string(b"\n".join(contents))
 
-    # Step 5: Trigger DAG
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
+with models.DAG(
+    dag_id="concat_gcs_text_files",
+    schedule_interval=None,
+    start_date=days_ago(1),
+    catchup=False,
+    tags=["gcs", "merge"],
+) as dag:
 
-    payload = {
-        "conf": {
-            "bucket": bucket,
-            "name": name
-        }
-    }
+    concat_task = PythonOperator(
+        task_id="concatenate_files",
+        python_callable=concatenate_files_gcs,
+        op_kwargs={
+            "bucket_name": BUCKET_NAME,
+            "source_prefix": SOURCE_PREFIX,
+            "destination_blob": DESTINATION_FILE,
+        },
+    )
 
-    response = requests.post(endpoint, headers=headers, json=payload)
-    
-    if response.status_code == 200:
-        print(f"DAG {dag_id} triggered successfully.")
-    else:
-        print(f"Failed to trigger DAG: {response.status_code}")
-        print(response.text)
+    concat_task
