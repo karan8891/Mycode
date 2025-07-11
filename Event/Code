@@ -1,57 +1,14 @@
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
-from google.cloud import storage
-import tempfile
-import os
-
-# Parameters
-SOURCE_BUCKET = 'gdw1_sandbox-corp-gdw-sfr-cdb8'
-SOURCE_PREFIX = 'gb_files/'
-DESTINATION_BUCKET = 'gdw1_sandbox-corp-gdw-sfr-cdb8'
-OUTPUT_BLOB_NAME = 'gb_files/merged_output.txt'
-
-def concatenate_gcs_text_files(**kwargs):
-    storage_client = storage.Client()
-    source_bucket = storage_client.bucket(SOURCE_BUCKET)
-    destination_bucket = storage_client.bucket(DESTINATION_BUCKET)
-
-    blobs = list(storage_client.list_blobs(source_bucket, prefix=SOURCE_PREFIX))
-
-    if not blobs:
-        print(f"No files found in {SOURCE_BUCKET}/{SOURCE_PREFIX}")
-        return
-
-    with tempfile.NamedTemporaryFile('w+', delete=False) as temp_file:
-        for blob in blobs:
-            print(f"Reading blob: {blob.name}")
-            with blob.open("r") as f:
-                for line in f:
-                    temp_file.write(line)
-        temp_file_path = temp_file.name
-
-    print(f"Uploading concatenated file to {OUTPUT_BLOB_NAME}")
-    output_blob = destination_bucket.blob(OUTPUT_BLOB_NAME)
-    output_blob.upload_from_filename(temp_file_path)
-
-    print(f"✅ Concatenated file uploaded to gs://{DESTINATION_BUCKET}/{OUTPUT_BLOB_NAME}")
-    os.remove(temp_file_path)
-
-default_args = {
-    'owner': 'airflow',
-    'start_date': days_ago(1),
-    'retries': 0,
+resource "google_storage_notification" "notify_pubsub_on_object_finalize_apmf2" {
+  bucket         = "apmf2_sandbox-corp-apmf-oaep-03fd"
+  topic          = "projects/sandbox-corp-apmf-oaep-03fd/topics/sandbox-pbs-apmf-02-sts"
+  payload_format = "JSON_API_V1"
+  event_types    = ["OBJECT_FINALIZE"]
 }
 
-with DAG(
-    dag_id='concat_gcs_text_files',
-    default_args=default_args,
-    schedule_interval=None,
-    catchup=False,
-    description='Concatenate multiple GCS text files into a single file',
-) as dag:
+resource "google_pubsub_topic_iam_member" "storage_pub_permission_apmf2" {
+  project = "sandbox-corp-apmf-oaep-03fd"
+  topic   = "sandbox-pbs-apmf-02-sts"
+  role    = "roles/pubsub.publisher"
 
-    concatenate_files = PythonOperator(
-        task_id='concatenate_files',
-        python_callable=concatenate_gcs_text_files,
-    )
+  member  = "serviceAccount:service-870d82702d05@gcp-sa-pubsub.iam.gserviceaccount.com"
+}
