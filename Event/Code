@@ -1,15 +1,58 @@
-resource "google_storage_notification" "notify_pubsub_on_object_finalize" {
-  bucket         = google_storage_bucket.gdw1_sandbox_corp_gdw_sfr_cdb8.name
-  topic          = "projects/sandbox-corp-gdw-sfr-cdb8/topics/sandbox-pbs-gdw-0213646-01-sts"
-  payload_format = "JSON_API_V1"
-  event_types    = ["OBJECT_FINALIZE"]
+import functions_framework
+import requests
+import google.auth
+import google.auth.transport.requests
+import os
+import json
 
-  depends_on = [google_storage_bucket.gdw1_sandbox_corp_gdw_sfr_cdb8]
-}
+@functions_framework.cloud_event
+def main(cloud_event):
+    # Step 1: Get env vars
+    dag_id = "gdw_to_apmf_push_dag"  # Change as needed
+    composer_env_url = os.environ.get("COMPOSER_WEBSERVER_URL")  # NEW VAR!
+    project_id = os.environ.get("PROJECT_ID", "")
+    
+    if not composer_env_url:
+        print("COMPOSER_WEBSERVER_URL env variable not found.")
+        return
 
-resource "google_pubsub_topic_iam_member" "storage_pub_permission" {
-  project = "sandbox-corp-gdw-sfr-cdb8"
-  topic   = "sandbox-pbs-gdw-0213646-01-sts"
-  role    = "roles/pubsub.publisher"
-  member  = "serviceAccount:service-870078270208@gs-project-accounts.iam.gserviceaccount.com"
-}
+    # Step 2: Extract GCS bucket event
+    data = cloud_event.data
+    bucket = data.get("bucket")
+    name = data.get("name")
+
+    if not name:
+        print("No object name in event.")
+        return
+
+    print(f"Received file {name} in bucket {bucket} -> triggering DAG: {dag_id}")
+
+    # Step 3: Prepare Airflow trigger endpoint
+    endpoint = f"{composer_env_url}/api/v1/dags/{dag_id}/dagRuns"
+    
+    # Step 4: Auth token
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    auth_req = google.auth.transport.requests.Request()
+    credentials.refresh(auth_req)
+    token = credentials.token
+
+    # Step 5: Trigger DAG
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+    payload = {
+        "conf": {
+            "bucket": bucket,
+            "name": name
+        }
+    }
+
+    response = requests.post(endpoint, headers=headers, json=payload)
+    
+    if response.status_code == 200:
+        print(f"DAG {dag_id} triggered successfully.")
+    else:
+        print(f"Failed to trigger DAG: {response.status_code}")
+        print(response.text)
