@@ -1,66 +1,41 @@
-import functions_framework
-import requests
-import google.auth
-import google.auth.transport.requests
-import os
-import json
-import base64
+from airflow import models
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+from googleapiclient.discovery import build
+from airflow.utils.dates import days_ago
+from google.auth import default
 
-@functions_framework.cloud_event
-def main(cloud_event):
-    # Step 1: Get env vars
-    dag_id = "apmf_to_gdw_pull_dag"  # Change if needed
-    composer_env_url = os.environ.get("COMPOSER_WEBSERVER_URL")
-    project_id = os.environ.get("PROJECT_ID", "")
+# Replace with actual job ID and project ID
+STS_JOB_NAME = "transferJobs/5916897567283792656"  # APMF to GDW pull STS job
+PROJECT_ID = "sandbox-corp-gdw-sfr-cdb8"           # STS job project (GDW project)
 
-    if not composer_env_url:
-        print("COMPOSER_WEBSERVER_URL env variable not found.")
-        return
+def trigger_sts_pull_job():
+    credentials, _ = default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    service = build("storagetransfer", "v1", credentials=credentials)
 
-    # Step 2: Extract GCS bucket + file name from Pub/Sub message
-    try:
-        pubsub_message = cloud_event.data["message"]["data"]
-        decoded_data = base64.b64decode(pubsub_message).decode("utf-8")
-        event_data = json.loads(decoded_data)
-    except Exception as e:
-        print(f"Failed to decode or parse message: {e}")
-        return
+    response = service.transferJobs().run(
+        jobName=STS_JOB_NAME,
+        body={"projectId": PROJECT_ID}
+    ).execute()
 
-    bucket = event_data.get("bucket")
-    name = event_data.get("name")
+    print(f"Triggered STS job: {response}")
 
-    if not name:
-        print("No object name in event.")
-        return
+default_args = {
+    "start_date": datetime(2023, 1, 1),
+    "retries": 1,
+}
 
-    print(f"📦 Received file '{name}' in bucket '{bucket}' -> triggering DAG: {dag_id}")
+with models.DAG(
+    dag_id="apmf_to_gdw_pull_dag",
+    default_args=default_args,
+    schedule_interval=None,  # Triggered by Cloud Function
+    catchup=False,
+    tags=["sts", "pull"],
+) as dag:
 
-    # Step 3: Prepare Airflow trigger endpoint
-    endpoint = f"{composer_env_url}/api/v1/dags/{dag_id}/dagRuns"
+    run_transfer = PythonOperator(
+        task_id="trigger_sts_pull_job",
+        python_callable=trigger_sts_pull_job,
+    )
 
-    # Step 4: Auth token
-    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-    auth_req = google.auth.transport.requests.Request()
-    credentials.refresh(auth_req)
-    token = credentials.token
-
-    # Step 5: Trigger DAG
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-
-    payload = {
-        "conf": {
-            "bucket": bucket,
-            "name": name
-        }
-    }
-
-    response = requests.post(endpoint, headers=headers, json=payload)
-
-    if response.status_code == 200:
-        print(f"✅ DAG '{dag_id}' triggered successfully.")
-    else:
-        print(f"❌ Failed to trigger DAG: {response.status_code}")
-        print(response.text)
+    run_transfer
