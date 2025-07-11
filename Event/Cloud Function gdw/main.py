@@ -1,54 +1,66 @@
-import base64
-import json
-import os
+import functions_framework
 import requests
-from google.auth.transport.requests import Request
-from google.oauth2 import id_token
+import google.auth
+import google.auth.transport.requests
+import os
+import json
+import base64
 
-COMPOSER_ENV = os.getenv("COMPOSER_ENV")
-COMPOSER_LOCATION = os.getenv("COMPOSER_LOCATION")
-PROJECT_ID = os.getenv("PROJECT_ID")
+@functions_framework.cloud_event
+def main(cloud_event):
+    # Step 1: Get env vars
+    dag_id = "gdw_to_apmf_push_dag"  # 🔁 Change if needed
+    composer_env_url = os.environ.get("COMPOSER_WEBSERVER_URL")
+    project_id = os.environ.get("PROJECT_ID", "")
 
-DAG_MAPPING = {
-    "apmf_to_gdw_event_push": "apmf_to_gdw_event_push",
-    "apmf_to_gdw_event_pull": "apmf_to_gdw_event_pull",
-    "dag1_gdw_to_apmf_push_dag": "gdw_to_apmf_push_dag",
-    "dag3_gdw_to_apmf_pull_dag": "gdw_to_apmf_pull_dag"
-}
+    if not composer_env_url:
+        print("COMPOSER_WEBSERVER_URL env variable not found.")
+        return
 
-def trigger_dag(dag_id):
-    url = f"https://composer.googleapis.com/v1/projects/{PROJECT_ID}/locations/{COMPOSER_LOCATION}/environments/{COMPOSER_ENV}/dagExecutions"
+    # Step 2: Extract GCS bucket + file name from Pub/Sub message
+    try:
+        pubsub_message = cloud_event.data["message"]["data"]
+        decoded_data = base64.b64decode(pubsub_message).decode("utf-8")
+        event_data = json.loads(decoded_data)
+    except Exception as e:
+        print(f"Failed to decode or parse message: {e}")
+        return
 
-    token = id_token.fetch_id_token(Request(), url)
+    bucket = event_data.get("bucket")
+    name = event_data.get("name")
+
+    if not name:
+        print("No object name in event.")
+        return
+
+    print(f"📦 Received file '{name}' in bucket '{bucket}' -> triggering DAG: {dag_id}")
+
+    # Step 3: Prepare Airflow trigger endpoint
+    endpoint = f"{composer_env_url}/api/v1/dags/{dag_id}/dagRuns"
+
+    # Step 4: Auth token
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    auth_req = google.auth.transport.requests.Request()
+    credentials.refresh(auth_req)
+    token = credentials.token
+
+    # Step 5: Trigger DAG
     headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
     }
 
-    payload = {"dagId": dag_id}
-    response = requests.post(url, headers=headers, json=payload)
-    print(f"Triggered DAG {dag_id}, response: {response.text}")
-    return response.status_code
+    payload = {
+        "conf": {
+            "bucket": bucket,
+            "name": name
+        }
+    }
 
-def determine_type(data):
-    job_name = data.get("name", "")
-    for key in DAG_MAPPING:
-        if key in job_name.lower():
-            return DAG_MAPPING[key]
-    return None
+    response = requests.post(endpoint, headers=headers, json=payload)
 
-def main(event, context):
-    if "data" not in event:
-        print("No data in Pub/Sub message")
-        return
-
-    payload = base64.b64decode(event["data"]).decode("utf-8")
-    data = json.loads(payload)
-
-    print("Received STS event:", json.dumps(data, indent=2))
-    dag_id = determine_type(data)
-    if not dag_id:
-        print("No matching DAG for job name")
-        return
-
-    trigger_dag(dag_id)
+    if response.status_code == 200:
+        print(f"✅ DAG '{dag_id}' triggered successfully.")
+    else:
+        print(f"❌ Failed to trigger DAG: {response.status_code}")
+        print(response.text)
