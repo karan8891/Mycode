@@ -1,50 +1,56 @@
-import base64
-import json
-import os
-import requests
-from google.auth.transport.requests import Request
-from google.oauth2 import id_token
+from airflow import models
+from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
+from google.cloud import storage
+from googleapiclient.discovery import build
+from google.auth import default
+import time
 
-COMPOSER_ENV = os.getenv("COMPOSER_ENV")
-COMPOSER_LOCATION = os.getenv("COMPOSER_LOCATION")
-PROJECT_ID = os.getenv("PROJECT_ID")
+STS_JOB_NAME = "transferJobs/6009691888195171934"
+PROJECT_ID = "sandbox-corp-gdw-sfr-cdb8"  # GDW project ID
+SOURCE_BUCKET = "your-source-bucket-name"
+SOURCE_PREFIX = "folder/"  # optional
 
-DAG_MAPPING = {
-    "gdw1_sandbox-corp-gdw-sfr-cdb8": "gdw_to_apmf_push_dag",
-    "apmf1_sandbox-corp-apmf-oaep-d3f4": "gdw_to_apmf_pull_dag"
+# 1. Check if files exist recently
+def should_trigger_sts_job():
+    client = storage.Client()
+    bucket = client.get_bucket(SOURCE_BUCKET)
+    now = time.time()
+    new_file_found = False
+
+    for blob in bucket.list_blobs(prefix=SOURCE_PREFIX):
+        if blob.updated.timestamp() > now - 300:  # last 5 min
+            print(f"New file: {blob.name} updated at {blob.updated}")
+            new_file_found = True
+            break
+
+    if new_file_found:
+        credentials, _ = default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        service = build("storagetransfer", "v1", credentials=credentials)
+        response = service.transferJobs().run(
+            jobName=STS_JOB_NAME,
+            body={"projectId": PROJECT_ID}
+        ).execute()
+        print(f"Triggered STS job: {response}")
+    else:
+        print("No new files found in last 5 minutes. Skipping STS trigger.")
+
+default_args = {
+    "start_date": datetime(2023, 1, 1),
+    "retries": 1,
 }
 
-def trigger_dag(dag_id):
-    url = (
-        f"https://composer.googleapis.com/v1/projects/{PROJECT_ID}/locations/"
-        f"{COMPOSER_LOCATION}/environments/{COMPOSER_ENV}/dagExecutions"
+with models.DAG(
+    dag_id="gdw_to_apmf_push_dag",
+    default_args=default_args,
+    schedule_interval=None,  # Only triggered by Cloud Function
+    catchup=False,
+    max_active_runs=1,
+    concurrency=1,
+    tags=["sts", "push"],
+) as dag:
+
+    run_transfer = PythonOperator(
+        task_id="conditionally_trigger_sts_push_job",
+        python_callable=should_trigger_sts_job,
     )
-
-    token = id_token.fetch_id_token(Request(), url)
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {"dagId": dag_id}
-    response = requests.post(url, headers=headers, json=payload)
-    print(f"Triggered DAG '{dag_id}', response: {response.text}")
-    return response.status_code
-
-def main(event, context):
-    if "data" not in event:
-        print("No data in Pub/Sub message")
-        return
-
-    payload = base64.b64decode(event["data"]).decode("utf-8")
-    data = json.loads(payload)
-
-    bucket_name = data.get("bucket", "").lower()
-    print(f"Received GCS bucket: {bucket_name}")
-
-    dag_id = DAG_MAPPING.get(bucket_name)
-    if not dag_id:
-        print("No matching DAG for bucket")
-        return
-
-    trigger_dag(dag_id)
