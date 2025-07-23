@@ -38,6 +38,7 @@ requests.post(dag_trigger_url, headers=headers, json={"conf": dag_payload})
 ------------------------------
 
 from airflow import DAG from airflow.operators.python import PythonOperator from airflow.providers.google.cloud.operators.cloud_storage_transfer_service import ( CloudDataTransferServiceCreateJobOperator, CloudDataTransferServiceRunJobOperator, CloudDataTransferServiceDeleteJobOperator, ) from airflow.providers.google.cloud.sensors.pubsub import PubSubPullSensor from airflow.utils.dates import days_ago import json, uuid
+from google.cloud import pubsub_v1
 
 def create_sts_job_payload(conf): job_name = f"transferJobs/{str(uuid.uuid4())[:8]}" return { "description": job_name, "project_id": "cdmp-project-id", "transfer_spec": { "gcs_data_source": {"bucket_name": conf["bucket"]}, "gcs_data_sink": {"bucket_name": "cdmp-destination-bucket"}, "object_conditions": {"include_prefixes": [conf["object"]]} }, "status": "ENABLED", "notification_config": { "pubsub_topic": "projects/cdmp-project/topics/sts-completion-topic", "event_types": ["TRANSFER_OPERATION_SUCCESS"] }, "transfer_options": { "delete_objects_from_source_after_transfer": conf.get("delete_after_transfer", False) } }
 
@@ -69,10 +70,27 @@ wait_for_completion = PubSubPullSensor(
 )
 
 def delete_job_and_notify(**kwargs):
-    import requests
+    import os
+    import json
+
     job_id = kwargs['ti'].xcom_pull(task_ids='create_sts_job')['description']
-    # Notify downstream service (CDMNxt) with TOC file name
-    requests.post("https://cdmnxt-service-url.com/trigger", json={"toc_file": kwargs['dag_run'].conf['object']})
+    conf = kwargs['dag_run'].conf
+    toc_file_name = conf.get('object')  # Assuming this is your TOC file
+
+    # Publish to CDMNxt Pub/Sub topic
+    publisher = pubsub_v1.PublisherClient()
+    topic_path = publisher.topic_path("cdmp-project-id", "cdmnxt-trigger-topic")
+
+    message_data = json.dumps({
+        "toc_file": toc_file_name,
+        "source_bucket": conf.get("bucket"),
+        "source_project": conf.get("project_id"),
+        "delete_after_transfer": conf.get("delete_after_transfer", False)
+    }).encode("utf-8")
+
+    future = publisher.publish(topic_path, message_data)
+    future.result()
+
     return job_id
 
 cleanup = PythonOperator(
