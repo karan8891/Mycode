@@ -1,136 +1,54 @@
-This is a complete end-to-end implementation in Python + Airflow DAG + Terraform concepts.
+import base64
+import json
+import requests
+from google.auth.transport import requests as auth_requests
+from google.oauth2 import id_token
+import google.auth
 
-It simulates Five9 (APMF) uploading files and CDMP (GDW) receiving the transfer.
+def main(event, context):
+    if 'data' not in event:
+        raise ValueError("No data field in the Pub/Sub message")
 
-The STS job is dynamically created and deleted. It waits for STS completion before cleanup and notifying CDMNxt.
+    # Decode Pub/Sub message
+    message_data = base64.b64decode(event['data']).decode('utf-8')
+    message = json.loads(message_data)
 
-------------------------------
+    bucket = message.get("bucket")
+    object_name = message.get("object") or message.get("name")
+    project_id = message.get("project_id")
+    delete_after_transfer = message.get("delete_after_transfer", False)
 
-1. Cloud Function (APMF side)
+    if not bucket or not object_name or not project_id:
+        raise ValueError("Missing required fields in Pub/Sub message")
 
-------------------------------
+    # Composer Airflow Webserver URL
+    dag_url = "https://<REPLACE-WITH-COMPOSER-WEBSERVER-URL>/api/experimental/dags/event_sts_transfer_dag/dag_runs"
 
-Triggered by Five9's Pub/Sub with schema: bucket, object, delete_after_transfer
+    # Build DAG config
+    dag_conf = {
+        "bucket": bucket,
+        "object": object_name,
+        "project_id": project_id,
+        "delete_after_transfer": delete_after_transfer
+    }
 
-def main(event, context): import base64, json, requests
+    print("Parsed DAG configuration:", dag_conf)
 
-if 'data' not in event:
-    raise ValueError("No data in Pub/Sub message")
+    # Get ID token to authorize with Composer Webserver
+    credentials, _ = google.auth.default()
+    auth_req = auth_requests.Request()
+    credentials.refresh(auth_req)
+    id_token_val = credentials.token
 
-message = json.loads(base64.b64decode(event['data']).decode('utf-8'))
+    headers = {
+        "Authorization": f"Bearer {id_token_val}",
+        "Content-Type": "application/json"
+    }
 
-dag_payload = {
-    "bucket": message.get("bucket"),
-    "object": message.get("object"),
-    "project_id": message.get("project_id"),
-    "delete_after_transfer": message.get("delete_after_transfer", False)
-}
+    # Trigger DAG
+    response = requests.post(dag_url, headers=headers, json={"conf": dag_conf})
 
-dag_trigger_url = "https://<composer-webserver-url>/api/experimental/dags/event_sts_transfer_dag/dag_runs"
-headers = {"Content-Type": "application/json", "Authorization": "Bearer <ID_TOKEN>"}
+    if response.status_code not in [200, 201]:
+        raise RuntimeError(f"Failed to trigger DAG: {response.status_code} {response.text}")
 
-requests.post(dag_trigger_url, headers=headers, json={"conf": dag_payload})
-
-------------------------------
-
-2. Airflow DAG (CDMP side)
-
-------------------------------
-
-from airflow import DAG from airflow.operators.python import PythonOperator from airflow.providers.google.cloud.operators.cloud_storage_transfer_service import ( CloudDataTransferServiceCreateJobOperator, CloudDataTransferServiceRunJobOperator, CloudDataTransferServiceDeleteJobOperator, ) from airflow.providers.google.cloud.sensors.pubsub import PubSubPullSensor from airflow.utils.dates import days_ago import json, uuid
-from google.cloud import pubsub_v1
-
-def create_sts_job_payload(conf): job_name = f"transferJobs/{str(uuid.uuid4())[:8]}" return { "description": job_name, "project_id": "cdmp-project-id", "transfer_spec": { "gcs_data_source": {"bucket_name": conf["bucket"]}, "gcs_data_sink": {"bucket_name": "cdmp-destination-bucket"}, "object_conditions": {"include_prefixes": [conf["object"]]} }, "status": "ENABLED", "notification_config": { "pubsub_topic": "projects/cdmp-project/topics/sts-completion-topic", "event_types": ["TRANSFER_OPERATION_SUCCESS"] }, "transfer_options": { "delete_objects_from_source_after_transfer": conf.get("delete_after_transfer", False) } }
-
-with DAG( "event_sts_transfer_dag", schedule_interval=None, start_date=days_ago(1), catchup=False, params={"job_id": None} ) as dag:
-
-def build_transfer_body(**kwargs):
-    conf = kwargs['dag_run'].conf
-    return create_sts_job_payload(conf)
-
-create_job = CloudDataTransferServiceCreateJobOperator(
-    task_id="create_sts_job",
-    body=build_transfer_body(),
-    do_xcom_push=True
-)
-
-run_job = CloudDataTransferServiceRunJobOperator(
-    task_id="run_sts_job",
-    job_name="{{ task_instance.xcom_pull(task_ids='create_sts_job')['description'] }}",
-    project_id="cdmp-project-id"
-)
-
-wait_for_completion = PubSubPullSensor(
-    task_id="wait_for_completion",
-    project_id="cdmp-project-id",
-    subscription="projects/cdmp-project/subscriptions/sts-completion-sub",
-    ack_messages=True,
-    max_messages=5,
-    timeout=600
-)
-
-def delete_job_and_notify(**kwargs):
-    import os
-    import json
-
-    job_id = kwargs['ti'].xcom_pull(task_ids='create_sts_job')['description']
-    conf = kwargs['dag_run'].conf
-    toc_file_name = conf.get('object')  # Assuming this is your TOC file
-
-    # Publish to CDMNxt Pub/Sub topic
-    publisher = pubsub_v1.PublisherClient()
-    topic_path = publisher.topic_path("cdmp-project-id", "cdmnxt-trigger-topic")
-
-    message_data = json.dumps({
-        "toc_file": toc_file_name,
-        "source_bucket": conf.get("bucket"),
-        "source_project": conf.get("project_id"),
-        "delete_after_transfer": conf.get("delete_after_transfer", False)
-    }).encode("utf-8")
-
-    future = publisher.publish(topic_path, message_data)
-    future.result()
-
-    return job_id
-
-cleanup = PythonOperator(
-    task_id="delete_job_notify",
-    python_callable=delete_job_and_notify
-)
-
-delete_job = CloudDataTransferServiceDeleteJobOperator(
-    task_id="delete_sts_job",
-    job_name="{{ task_instance.xcom_pull(task_ids='create_sts_job')['description'] }}",
-    project_id="cdmp-project-id"
-)
-
-create_job >> run_job >> wait_for_completion >> cleanup >> delete_job
-
-------------------------------
-
-3. Terraform (example blocks)
-
-------------------------------
-
-In cloudfunction module (main.tf):
-
-resource "google_cloudfunctions_function" "event_trigger" { name        = "five9-cf-trigger" runtime     = "python39" entry_point = "main" source_archive_bucket = "apmf-cloud-function-src" source_archive_object = "src.zip" event_trigger { event_type = "google.pubsub.topic.publish" resource   = google_pubsub_topic.five9_topic.id } }
-
-In pubsub module:
-
-resource "google_pubsub_topic" "five9_topic" { name = "five9-trigger-topic" } resource "google_pubsub_topic" "completion_topic" { name = "sts-completion-topic" } resource "google_pubsub_subscription" "completion_sub" { name  = "sts-completion-sub" topic = google_pubsub_topic.completion_topic.id }
-
-------------------------------
-
-Summary:
-
-- Five9 sends upload event via Pub/Sub
-
-- APMF CF triggers Airflow DAG
-
-- DAG creates/runs/deletes STS job
-
-- Waits for STS completion
-
-- Notifies CDMNxt via HTTP (or triggers next DAG/CF)
-
+    print("Triggered DAG successfully.")
