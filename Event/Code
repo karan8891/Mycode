@@ -1,54 +1,36 @@
 import base64
 import json
 import requests
-from google.auth.transport import requests as auth_requests
-from google.oauth2 import id_token
-import google.auth
 
 def main(event, context):
     if 'data' not in event:
-        raise ValueError("No data field in the Pub/Sub message")
+        raise ValueError("Missing Pub/Sub message")
 
-    # Decode Pub/Sub message
-    message_data = base64.b64decode(event['data']).decode('utf-8')
-    message = json.loads(message_data)
+    pubsub_data = base64.b64decode(event['data']).decode('utf-8')
+    gcs_event = json.loads(pubsub_data)
 
-    bucket = message.get("bucket")
-    object_name = message.get("object") or message.get("name")
-    project_id = message.get("project_id")
-    delete_after_transfer = message.get("delete_after_transfer", False)
+    # Extract details from GCS notification
+    bucket = gcs_event.get("bucket")
+    object_name = gcs_event.get("name") or gcs_event.get("object")
+    project_id = gcs_event.get("projectId", "sandbox-corp-apmf-<your-suffix>")
 
-    if not bucket or not object_name or not project_id:
-        raise ValueError("Missing required fields in Pub/Sub message")
-
-    # Composer Airflow Webserver URL
-    dag_url = "https://<REPLACE-WITH-COMPOSER-WEBSERVER-URL>/api/experimental/dags/event_sts_transfer_dag/dag_runs"
-
-    # Build DAG config
-    dag_conf = {
+    # Add any static or dynamic enrichment here
+    payload = {
         "bucket": bucket,
         "object": object_name,
         "project_id": project_id,
-        "delete_after_transfer": delete_after_transfer
+        "delete_after_transfer": True  # or False if default
     }
 
-    print("Parsed DAG configuration:", dag_conf)
+    gdw_cf_url = "https://REGION-PROJECT.cloudfunctions.net/gdw-trigger-function"  # Replace with GDW CF URL
 
-    # Get ID token to authorize with Composer Webserver
-    credentials, _ = google.auth.default()
-    auth_req = auth_requests.Request()
-    credentials.refresh(auth_req)
-    id_token_val = credentials.token
-
+    # Auth header - for internal GCP calls, often this works (no token needed), but safer with ID token
     headers = {
-        "Authorization": f"Bearer {id_token_val}",
         "Content-Type": "application/json"
     }
 
-    # Trigger DAG
-    response = requests.post(dag_url, headers=headers, json={"conf": dag_conf})
-
+    response = requests.post(gdw_cf_url, json=payload, headers=headers)
     if response.status_code not in [200, 201]:
-        raise RuntimeError(f"Failed to trigger DAG: {response.status_code} {response.text}")
+        raise RuntimeError(f"Failed to invoke GDW CF: {response.status_code} - {response.text}")
 
-    print("Triggered DAG successfully.")
+    print("Successfully triggered GDW CF")
