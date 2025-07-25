@@ -1,36 +1,60 @@
 import base64
 import json
-import requests
+import os
+from google.cloud import storage, pubsub_v1
+
+# ENV VARS
+DEST_PROJECT = os.getenv("DEST_PROJECT", "sandbox-corp-gdw-cdmp-xxxx")
+DEST_BUCKET = os.getenv("DEST_BUCKET", "cdmp-destination-bucket")
+DEST_TOPIC = os.getenv("DEST_TOPIC", "projects/sandbox-corp-gdw-cdmp-xxxx/topics/gdw-sts-trigger-topic")
 
 def main(event, context):
-    if 'data' not in event:
-        raise ValueError("Missing Pub/Sub message")
+    try:
+        # Parse metadata file GCS trigger info
+        bucket_name = event['bucket']
+        metadata_file = event['name']  # e.g., metadata/abc.json
+        if not metadata_file.endswith(".json"):
+            print("Not a JSON metadata file. Ignored.")
+            return
 
-    pubsub_data = base64.b64decode(event['data']).decode('utf-8')
-    gcs_event = json.loads(pubsub_data)
+        # Read and parse metadata file
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(metadata_file)
+        metadata = json.loads(blob.download_as_text())
 
-    # Extract details from GCS notification
-    bucket = gcs_event.get("bucket")
-    object_name = gcs_event.get("name") or gcs_event.get("object")
-    project_id = gcs_event.get("projectId", "sandbox-corp-apmf-<your-suffix>")
+        object_path = metadata.get("file")
+        delete_flag = metadata.get("delete_after_transfer", False)
 
-    # Add any static or dynamic enrichment here
-    payload = {
-        "bucket": bucket,
-        "object": object_name,
-        "project_id": project_id,
-        "delete_after_transfer": True  # or False if default
-    }
+        if not object_path:
+            print("Missing 'file' field in metadata.")
+            return
 
-    gdw_cf_url = "https://REGION-PROJECT.cloudfunctions.net/gdw-trigger-function"  # Replace with GDW CF URL
+        # Build enriched message to trigger GDW CF
+        enriched_message = {
+            "bucket": bucket_name,
+            "object": object_path,
+            "project_id": os.getenv("SOURCE_PROJECT", "sandbox-corp-apmf-oaep-03fd"),
+            "delete_after_transfer": delete_flag
+        }
 
-    # Auth header - for internal GCP calls, often this works (no token needed), but safer with ID token
-    headers = {
-        "Content-Type": "application/json"
-    }
+        # Publish to GDW Pub/Sub topic
+        publisher = pubsub_v1.PublisherClient()
+        topic_path = DEST_TOPIC
+        publisher.publish(topic_path, json.dumps(enriched_message).encode("utf-8"))
+        print(f"Published message to {topic_path}: {enriched_message}")
 
-    response = requests.post(gdw_cf_url, json=payload, headers=headers)
-    if response.status_code not in [200, 201]:
-        raise RuntimeError(f"Failed to invoke GDW CF: {response.status_code} - {response.text}")
+        # Optional: Write TOC file to DEST_BUCKET (same name with .toc.json)
+        toc_blob_name = f"toc/{os.path.basename(object_path)}.toc.json"
+        toc_data = {
+            "source_bucket": bucket_name,
+            "source_object": object_path,
+            "delete_after_transfer": delete_flag
+        }
+        destination_bucket = storage_client.bucket(DEST_BUCKET)
+        toc_blob = destination_bucket.blob(toc_blob_name)
+        toc_blob.upload_from_string(json.dumps(toc_data), content_type="application/json")
+        print(f"TOC file written to {DEST_BUCKET}/{toc_blob_name}")
 
-    print("Successfully triggered GDW CF")
+    except Exception as e:
+        print(f"Error: {e}")
