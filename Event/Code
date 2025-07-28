@@ -1,80 +1,62 @@
-import os
-import json
 import base64
-from google.cloud import storage, pubsub_v1
-from datetime import timezone
+import json
+import os
+import google.auth
+from google.auth.transport import requests
+import requests as external_requests
 
-# ENV variables
-DEST_PROJECT = os.getenv("DEST_PROJECT", "sandbox-corp-gdw-sfr-cdb8")
-DEST_BUCKET = os.getenv("DEST_BUCKET", "gdw2-sandbox-corp-gdw-sfr-cdb8")
-DEST_TOPIC = os.getenv("DEST_TOPIC", "projects/sandbox-corp-gdw-sfr-cdb8/topics/sandbox-pbs-apmf-0237787-02-sts")
+# Set this as an environment variable in Cloud Function deployment
+DAG_TRIGGER_URL = os.getenv("DAG_TRIGGER_URL")  # e.g., https://composer-url/api/experimental/dags/event_sts_transfer_dag/dag_runs
 
 def main(event, context):
     try:
-        # Decode message
-        message = base64.b64decode(event['data']).decode('utf-8')
-        payload = json.loads(message)
+        if 'data' not in event:
+            raise ValueError("No data in Pub/Sub message")
 
-        # Extract schema fields
-        src_bucket = payload["cdm_source_bucket"]
-        prefix = payload.get("cdm_file_prefix_pattern", "")
-        src_project = payload.get("cdm_source_project_id", "")
-        delete_flag = payload.get("delete_source_files_after_transfer", False)
+        # Decode the Pub/Sub message
+        message_data = base64.b64decode(event['data']).decode("utf-8")
+        payload = json.loads(message_data)
 
-        if not src_bucket:
-            print("Missing required field: cdm_source_bucket")
-            return
+        # Log received payload
+        print("Received payload:", payload)
 
-        # Initialize GCS client
-        storage_client = storage.Client(project=src_project)
-        bucket = storage_client.bucket(src_bucket)
-
-        # List all objects with prefix
-        blobs = list(bucket.list_blobs(prefix=prefix))
-        if not blobs:
-            print(f"No files found in {src_bucket} with prefix {prefix}")
-            return
-
-        # Prepare TOC entries
-        toc_entries = []
-        object_names = []
-
-        for blob in blobs:
-            toc_entries.append({
-                "file": blob.name,
-                "size": blob.size,
-                "timestamp": blob.updated.astimezone(timezone.utc).isoformat()
-            })
-            object_names.append(blob.name)
-
-        # TOC file content
-        toc_data = {
-            "source_bucket": src_bucket,
-            "source_objects": object_names,
-            "delete_after_transfer": delete_flag,
-            "files": toc_entries
+        # Extract required fields
+        dag_conf = {
+            "bucket": payload.get("cdm_source_bucket"),
+            "object": payload.get("cdm_source_objects"),
+            "project_id": payload.get("cdm_source_project_id"),
+            "prefix": payload.get("cdm_file_prefix_pattern", ""),
+            "delete_after_transfer": payload.get("delete_source_files_after_transfer", False),
+            "toc_file_name": payload.get("toc_file_name")
         }
 
-        # Generate TOC filename
-        toc_filename = f"{prefix.rstrip('/') or 'root'}/toc.json"
-        destination_bucket = storage_client.bucket(DEST_BUCKET)
-        destination_blob = destination_bucket.blob(toc_filename)
-        destination_blob.upload_from_string(json.dumps(toc_data, indent=2), content_type="application/json")
-        print(f"TOC file uploaded: gs://{DEST_BUCKET}/{toc_filename}")
+        # Check for missing critical fields
+        if not dag_conf["bucket"] or not dag_conf["object"] or not dag_conf["project_id"]:
+            raise ValueError("Missing required fields in message")
 
-        # Update payload with toc.json and send to GDW
-        enriched_message = {
-            "cdm_source_bucket": src_bucket,
-            "cdm_file_prefix_pattern": prefix,
-            "cdm_source_project_id": src_project,
-            "cdm_source_objects": object_names + [toc_filename],
-            "delete_source_files_after_transfer": delete_flag
+        # Get ID token for Composer
+        credentials, _ = google.auth.default()
+        auth_req = requests.Request()
+        credentials.refresh(auth_req)
+        id_token = credentials.token
+
+        headers = {
+            "Authorization": f"Bearer {id_token}",
+            "Content-Type": "application/json"
         }
 
-        publisher = pubsub_v1.PublisherClient()
-        topic_path = DEST_TOPIC
-        publisher.publish(topic_path, json.dumps(enriched_message).encode("utf-8")).result()
-        print(f"Published message to {topic_path}")
+        # Trigger Airflow DAG
+        response = external_requests.post(
+            DAG_TRIGGER_URL,
+            headers=headers,
+            json={"conf": dag_conf}
+        )
+
+        if response.status_code not in [200, 201]:
+            raise RuntimeError(f"Failed to trigger DAG: {response.status_code} - {response.text}")
+        else:
+            print("DAG triggered successfully.")
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error: {str(e)}")
+        raise
