@@ -1,109 +1,12 @@
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
-from google.cloud import pubsub_v1
-from airflow.providers.google.cloud.operators.cloud_storage_transfer_service import (
-    CloudDataTransferServiceCreateJobOperator,
-    CloudDataTransferServiceRunJobOperator,
-    CloudDataTransferServiceDeleteJobOperator
-)
-from airflow.providers.google.cloud.sensors.pubsub import PubSubPullSensor
-import json
-import uuid
+resource "google_pubsub_subscription" "cf_trigger" {
+  name  = "gdw-cf-trigger"
+  topic = google_pubsub_topic.sts_completion_topic.name
+  push_config {
+    push_endpoint = "https://..."
+  }
+}
 
-# ─────────────────────────────────────────────────────────────
-# DAG config: Triggered externally by GDW CF from APMF message
-# ─────────────────────────────────────────────────────────────
-
-def create_sts_job_payload(conf):
-    job_name = f"transferJobs/{str(uuid.uuid4())[:8]}"
-    return {
-        "description": job_name,
-        "project_id": "cdmp-project-id",
-        "transfer_spec": {
-            "gcs_data_source": {
-                "bucket_name": conf.get("bucket")
-            },
-            "gcs_data_sink": {
-                "bucket_name": "cdmp-destination-bucket"
-            },
-            "object_conditions": {
-                "include_prefixes": conf.get("prefix", "").split(",") if conf.get("prefix") else [],
-                "exclude_prefixes": [],
-            },
-            "transfer_options": {
-                "delete_objects_from_source_after_transfer": conf.get("delete_after_transfer", False)
-            },
-            "notification_config": {
-                "pubsub_topic": "projects/cdmp-project-id/topics/sts-completion-topic",
-                "event_types": ["TRANSFER_OPERATION_SUCCESS"],
-                "payload_format": "JSON"
-            }
-        }
-    }
-
-with DAG(
-    dag_id="event_sts_transfer_dag",
-    start_date=days_ago(1),
-    schedule_interval=None,
-    catchup=False,
-    params={"job_id": None}
-) as dag:
-
-    def build_transfer_body(**kwargs):
-        conf = kwargs["dag_run"].conf
-        return create_sts_job_payload(conf)
-
-    create_job = CloudDataTransferServiceCreateJobOperator(
-        task_id="create_sts_job",
-        body=build_transfer_body,
-        xcom_push=True
-    )
-
-    run_job = CloudDataTransferServiceRunJobOperator(
-        task_id="run_sts_job",
-        job_name="{{ task_instance.xcom_pull(task_ids='create_sts_job')['description'] }}",
-        project_id="cdmp-project-id"
-    )
-
-    wait_for_completion = PubSubPullSensor(
-        task_id="wait_for_completion",
-        project_id="cdmp-project-id",
-        subscription="projects/cdmp-project-id/subscriptions/sts-completion-sub",
-        ack_messages=True,
-        max_messages=5,
-        timeout=600
-    )
-
-    def delete_job_and_notify(**kwargs):
-        job_id = kwargs["ti"].xcom_pull(task_ids="create_sts_job")["description"]
-        conf = kwargs["dag_run"].conf
-        toc_file_name = conf.get("toc_file_name")
-
-        # Construct message to trigger CDMNxt with TOC
-        message = {
-            "toc_file": toc_file_name,
-            "source_bucket": conf.get("bucket"),
-            "source_project": conf.get("project_id"),
-            "delete_after_transfer": conf.get("delete_after_transfer", False)
-        }
-
-        publisher = pubsub_v1.PublisherClient()
-        topic_path = publisher.topic_path("cdmp-project-id", "cdmnxt-trigger-topic")
-        publisher.publish(topic_path, json.dumps(message).encode("utf-8")).result()
-
-        return job_id
-
-    cleanup = PythonOperator(
-        task_id="delete_job_notify",
-        python_callable=delete_job_and_notify
-    )
-
-    delete_job = CloudDataTransferServiceDeleteJobOperator(
-        task_id="delete_sts_job",
-        job_name="{{ task_instance.xcom_pull(task_ids='create_sts_job')['description'] }}",
-        project_id="cdmp-project-id"
-    )
-
-    # DAG flow
-    create_job >> run_job >> wait_for_completion >> cleanup >> delete_job
+resource "google_pubsub_subscription" "dag_trigger" {
+  name  = "sts-completion-sub"
+  topic = google_pubsub_topic.sts_completion_topic.name
+}
