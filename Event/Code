@@ -1,68 +1,80 @@
-import base64
-import json
 import os
+import json
+import base64
 from google.cloud import storage, pubsub_v1
+from datetime import timezone
 
-# ENV VARS
-DEST_PROJECT = os.getenv("DEST_PROJECT", "sandbox-corp-gdw-cdmp-xxxx")
-DEST_BUCKET = os.getenv("DEST_BUCKET", "cdmp-destination-bucket")
-DEST_TOPIC = os.getenv("DEST_TOPIC", "projects/sandbox-corp-gdw-cdmp-xxxx/topics/gdw-sts-trigger-topic")
+# ENV variables
+DEST_PROJECT = os.getenv("DEST_PROJECT", "sandbox-corp-gdw-sfr-cdb8")
+DEST_BUCKET = os.getenv("DEST_BUCKET", "gdw2-sandbox-corp-gdw-sfr-cdb8")
+DEST_TOPIC = os.getenv("DEST_TOPIC", "projects/sandbox-corp-gdw-sfr-cdb8/topics/sandbox-pbs-apmf-0237787-02-sts")
 
 def main(event, context):
     try:
-        # Parse incoming message (from metadata.json or Pub/Sub)
-        message = base64.b64decode(event['data']).decode("utf-8")
+        # Decode message
+        message = base64.b64decode(event['data']).decode('utf-8')
         payload = json.loads(message)
 
-        src_bucket = payload.get("cdm_source_bucket")
-        src_objects = payload.get("cdm_source_objects", [])
+        # Extract schema fields
+        src_bucket = payload["cdm_source_bucket"]
         prefix = payload.get("cdm_file_prefix_pattern", "")
-        src_project = payload.get("cdm_source_project_id", "sandbox-corp-apmf-oaep-03fd")
+        src_project = payload.get("cdm_source_project_id", "")
         delete_flag = payload.get("delete_source_files_after_transfer", False)
 
-        if not src_bucket or not src_objects:
-            print("Missing required fields: 'cdm_source_bucket' or 'cdm_source_objects'")
+        if not src_bucket:
+            print("Missing required field: cdm_source_bucket")
             return
 
-        # Check if toc.json exists, else generate one
-        toc_blob_path = None
-        for obj in src_objects:
-            if obj.endswith("toc.json"):
-                toc_blob_path = obj
-                break
+        # Initialize GCS client
+        storage_client = storage.Client(project=src_project)
+        bucket = storage_client.bucket(src_bucket)
 
-        storage_client = storage.Client()
+        # List all objects with prefix
+        blobs = list(bucket.list_blobs(prefix=prefix))
+        if not blobs:
+            print(f"No files found in {src_bucket} with prefix {prefix}")
+            return
+
+        # Prepare TOC entries
+        toc_entries = []
+        object_names = []
+
+        for blob in blobs:
+            toc_entries.append({
+                "file": blob.name,
+                "size": blob.size,
+                "timestamp": blob.updated.astimezone(timezone.utc).isoformat()
+            })
+            object_names.append(blob.name)
+
+        # TOC file content
         toc_data = {
             "source_bucket": src_bucket,
-            "source_objects": src_objects,
-            "delete_after_transfer": delete_flag
+            "source_objects": object_names,
+            "delete_after_transfer": delete_flag,
+            "files": toc_entries
         }
 
-        if not toc_blob_path:
-            # Generate a toc.json file in destination
-            generated_toc_name = f"toc/{os.path.basename(src_objects[0])}.toc.json"
-            destination_bucket = storage_client.bucket(DEST_BUCKET)
-            destination_blob = destination_bucket.blob(generated_toc_name)
-            destination_blob.upload_from_string(json.dumps(toc_data), content_type="application/json")
-            toc_blob_path = generated_toc_name
-            print(f"Generated TOC and uploaded to: {generated_toc_name}")
-        else:
-            print(f"TOC file already present: {toc_blob_path}")
+        # Generate TOC filename
+        toc_filename = f"{prefix.rstrip('/') or 'root'}/toc.json"
+        destination_bucket = storage_client.bucket(DEST_BUCKET)
+        destination_blob = destination_bucket.blob(toc_filename)
+        destination_blob.upload_from_string(json.dumps(toc_data, indent=2), content_type="application/json")
+        print(f"TOC file uploaded: gs://{DEST_BUCKET}/{toc_filename}")
 
-        # Build message for GDW Cloud Function trigger
+        # Update payload with toc.json and send to GDW
         enriched_message = {
-            "bucket": src_bucket,
-            "objects": src_objects,
-            "prefix": prefix,
-            "project_id": src_project,
-            "delete_after_transfer": delete_flag
+            "cdm_source_bucket": src_bucket,
+            "cdm_file_prefix_pattern": prefix,
+            "cdm_source_project_id": src_project,
+            "cdm_source_objects": object_names + [toc_filename],
+            "delete_source_files_after_transfer": delete_flag
         }
 
-        # Publish to GDW CF Pub/Sub
         publisher = pubsub_v1.PublisherClient()
         topic_path = DEST_TOPIC
-        publisher.publish(topic_path, json.dumps(enriched_message).encode("utf-8"))
-        print(f"Published message to {topic_path}: {enriched_message}")
+        publisher.publish(topic_path, json.dumps(enriched_message).encode("utf-8")).result()
+        print(f"Published message to {topic_path}")
 
     except Exception as e:
         print(f"Error: {e}")
