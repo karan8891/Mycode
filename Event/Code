@@ -1,20 +1,11 @@
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
+from airflow.providers.google.cloud.operators.cloud_storage_transfer_service import (
+    CloudDataTransferServiceUpdateJobOperator,
+)
 
-def list_google_sts_operators():
-    from airflow.providers.google.cloud.operators import cloud_storage_transfer_service
-    print("Available operators in cloud_storage_transfer_service module:")
-    print(dir(cloud_storage_transfer_service))
-
-with DAG(
-    dag_id="debug_check_google_sts_operators",
-    start_date=days_ago(1),
-    schedule_interval=None,
-    catchup=False
-) as dag:
-
-    check_ops = PythonOperator(
-        task_id="list_sts_operators",
-        python_callable=list_google_sts_operators
-    )
+run_job = CloudDataTransferServiceUpdateJobOperator(
+    task_id="run_sts_job",
+    job_name="{{ task_instance.xcom_pull(task_ids='create_sts_job')['name'] }}",
+    project_id="your-cdmp-project-id",
+    update_body={"status": "ENABLED"},
+    update_mask="status",
+)
