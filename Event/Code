@@ -1,6 +1,77 @@
-resource "google_pubsub_subscription_iam_member" "cf_trigger_dag_subscriber" {
-  project      = var.project_id
-  subscription = google_pubsub_subscription.cf_trigger.name
-  role         = "roles/pubsub.subscriber"
-  member       = "serviceAccount:sa-sandbox-corp-gdw-sfr-cdb8-cw@sandbox-corp-gdw-sfr-cdb8.iam.gserviceaccount.com"
-}
+import os
+import json
+import base64
+import time
+from datetime import datetime
+from google.cloud import pubsub_v1
+
+# ENV Variables
+DEST_TOPIC = os.getenv("DEST_TOPIC", "projects/sandbox-corp-gdw-sfr-cdb8/topics/sts-completion-topic")
+
+# In-memory state (non-persistent across cold starts)
+pending_events = []
+last_trigger_time = 0  # Unix time
+
+
+def main(event, context):
+    global pending_events, last_trigger_time
+
+    try:
+        print("[INFO] Cloud Function triggered...")
+
+        # Step 1: Decode incoming message
+        message_str = base64.b64decode(event['data']).decode('utf-8')
+        payload = json.loads(message_str)
+        print(f"[INFO] Incoming bucket notification payload: {payload}")
+
+        # Step 2: Extract schema fields
+        src_bucket = payload.get("cdm_source_bucket")
+        prefix = payload.get("cdm_file_prefix_pattern", "")
+        src_project = payload.get("cdm_source_project_id", "")
+        delete_flag = payload.get("delete_source_files_after_transfer", False)
+
+        if not src_bucket:
+            print("[WARNING] Missing required field: cdm_source_bucket. Skipping this event.")
+            return
+
+        enriched_event = {
+            "cdm_source_bucket": src_bucket,
+            "cdm_file_prefix_pattern": prefix,
+            "cdm_source_project_id": src_project,
+            "delete_source_files_after_transfer": delete_flag
+        }
+
+        # Step 3: Add to in-memory buffer
+        pending_events.append(enriched_event)
+        print(f"[INFO] Buffered event. Total buffered: {len(pending_events)}")
+
+        # Step 4: Check 1-minute interval
+        current_time = time.time()
+        if current_time - last_trigger_time < 60:
+            print("[INFO] Not triggering DAG — less than 60 seconds since last publish.")
+            return
+
+        print("[INFO] 1-minute interval reached. Publishing to DAG...")
+        last_trigger_time = current_time
+
+        # Step 5: Prepare and publish batch message
+        batch_payload = {
+            "batch_timestamp": datetime.utcnow().isoformat(),
+            "file_events": pending_events
+        }
+
+        publisher = pubsub_v1.PublisherClient()
+        publisher.publish(
+            DEST_TOPIC,
+            json.dumps(batch_payload).encode("utf-8")
+        ).result()
+
+        print(f"[SUCCESS] Published batch of {len(pending_events)} events to: {DEST_TOPIC}")
+        print(f"[DEBUG] Message: {json.dumps(batch_payload, indent=2)}")
+
+        # Step 6: Clear buffer
+        pending_events.clear()
+        print("[INFO] Cleared event buffer after successful publish.")
+
+    except Exception as e:
+        print(f"[ERROR] Exception occurred: {e}")
