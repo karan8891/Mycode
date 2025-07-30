@@ -1,114 +1,23 @@
-import os
-import json
-import base64
-import time
-from datetime import datetime
-from google.cloud import pubsub_v1
-import google.auth.transport.requests
-from google.auth import default
-import requests
-
-# ENV Variables
-DEST_TOPIC = os.getenv("DEST_TOPIC", "projects/sandbox-corp-gdw-sfr-cdb8/topics/sts-completion-topic")
-COMPOSER_TRIGGER_URL = os.getenv("COMPOSER_TRIGGER_URL")  # Set this in your env variables
-
-# In-memory state (non-persistent)
-pending_events = []
-last_trigger_time = 0
-
-
-def trigger_dag(dag_id):
-    try:
-        if not COMPOSER_TRIGGER_URL:
-            print("[WARNING] COMPOSER_TRIGGER_URL not set. DAG trigger skipped.")
-            return
-
-        credentials, _ = default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-        auth_req = google.auth.transport.requests.Request()
-        credentials.refresh(auth_req)
-        id_token = credentials.token
-
-        url = f"{COMPOSER_TRIGGER_URL}/dags/{dag_id}/dagRuns"
-        payload = {
-            "dag_run_id": f"cf-trigger-{int(time.time())}"
-        }
-        headers = {
-            "Authorization": f"Bearer {id_token}",
-            "Content-Type": "application/json"
-        }
-
-        response = requests.post(url, headers=headers, json=payload)
-        if response.status_code == 200:
-            print(f"[SUCCESS] DAG {dag_id} triggered.")
-        else:
-            print(f"[ERROR] Failed to trigger DAG: {response.status_code} {response.text}")
-
-    except Exception as e:
-        print(f"[ERROR] Exception in DAG trigger: {e}")
-
-
-def main(event, context):
-    global pending_events, last_trigger_time
+def parse_apmf_event(**kwargs):
+    ti = kwargs["ti"]
+    raw = ti.xcom_pull(task_ids="wait_for_apmf_message")
 
     try:
-        print("[INFO] Cloud Function triggered...")
-
-        # Step 1: Decode incoming event
-        message_str = base64.b64decode(event['data']).decode('utf-8')
-        payload = json.loads(message_str)
-        print(f"[INFO] Incoming message payload: {payload}")
-
-        # Step 2: Extract and enrich
-        src_bucket = payload.get("cdm_source_bucket", "apmf2_sandbox-corp-apmf-oaep-03fd")
-        prefix = payload.get("cdm_file_prefix_pattern", "")
-        src_project = payload.get("cdm_source_project_id", "sandbox-corp-apmf-oaep-03fd")
-        delete_flag = payload.get("delete_source_files_after_transfer", False)
-
-        if not src_bucket:
-            print("[WARNING] Missing required field: cdm_source_bucket. Skipping event.")
-            return
-
-        enriched_event = {
-            "cdm_source_bucket": src_bucket,
-            "cdm_file_prefix_pattern": prefix,
-            "cdm_source_project_id": src_project,
-            "delete_source_files_after_transfer": delete_flag
-        }
-
-        # Step 3: Buffer message
-        pending_events.append(enriched_event)
-        print(f"[INFO] Event buffered. Total buffered: {len(pending_events)}")
-
-        # Step 4: Trigger once per minute
-        current_time = time.time()
-        if current_time - last_trigger_time < 60:
-            print("[INFO] Skipping DAG trigger — within 60-second window.")
-            return
-
-        last_trigger_time = current_time
-        print("[INFO] 60 seconds passed. Publishing batch and triggering DAG...")
-
-        # Step 5: Publish batch to Pub/Sub
-        batch_payload = {
-            "batch_timestamp": datetime.utcnow().isoformat(),
-            "file_events": pending_events
-        }
-
-        publisher = pubsub_v1.PublisherClient()
-        publisher.publish(
-            DEST_TOPIC,
-            json.dumps(batch_payload).encode("utf-8")
-        ).result()
-
-        print(f"[SUCCESS] Published {len(pending_events)} events to {DEST_TOPIC}")
-        print(f"[DEBUG] Payload: {json.dumps(batch_payload, indent=2)}")
-
-        # Step 6: Trigger Composer DAG
-        trigger_dag("apmf_to_gdw_pull_dag")
-
-        # Step 7: Clear buffer
-        pending_events.clear()
-        print("[INFO] Cleared buffer after successful publish and DAG trigger.")
-
+        parsed = json.loads(raw)  # parsed raw string to dict
+        batch = json.loads(parsed["message"]["data"])  # decode base64-style JSON payload
+        file_events = batch["file_events"]
     except Exception as e:
-        print(f"[ERROR] Exception occurred: {e}")
+        raise ValueError(f"[ERROR] Failed to parse message: {raw}, error: {e}")
+
+    # Group events by `delete_source_files_after_transfer` flag
+    grouped = {
+        True: [],
+        False: []
+    }
+
+    for event in file_events:
+        flag = event.get("delete_source_files_after_transfer", False)
+        grouped[flag].append(event)
+
+    # Push grouped events to XCom
+    ti.xcom_push(key="grouped_events", value=grouped)
