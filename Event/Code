@@ -3,13 +3,14 @@ def parse_apmf_event(**kwargs):
     raw = ti.xcom_pull(task_ids="wait_for_apmf_message")
 
     try:
-        parsed = json.loads(raw)  # parsed raw string to dict
-        batch = json.loads(parsed["message"]["data"])  # decode base64-style JSON payload
-        file_events = batch["file_events"]
+        parsed = raw[0]  # ✅ First element from the pulled list
+        message_data_b64 = parsed["message"]["data"]  # ✅ base64-encoded string
+        message_data = json.loads(base64.b64decode(message_data_b64).decode("utf-8"))  # ✅ Decode and parse
+        file_events = message_data["file_events"]
     except Exception as e:
         raise ValueError(f"[ERROR] Failed to parse message: {raw}, error: {e}")
 
-    # Group events by `delete_source_files_after_transfer` flag
+    # Group events by deletion flag
     grouped = {
         True: [],
         False: []
@@ -19,5 +20,4 @@ def parse_apmf_event(**kwargs):
         flag = event.get("delete_source_files_after_transfer", False)
         grouped[flag].append(event)
 
-    # Push grouped events to XCom
     ti.xcom_push(key="grouped_events", value=grouped)
