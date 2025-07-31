@@ -8,7 +8,6 @@ import base64
 
 PROJECT_ID = "sandbox-corp-gdw-sfr-cdp"
 SUBSCRIPTION_NAME = "cf-trigger-dag"
-TOPIC_NAME = "sts-completion-topic"
 
 default_args = {
     "owner": "airflow",
@@ -17,7 +16,7 @@ default_args = {
 }
 
 with DAG(
-    dag_id="log_cf_message_only",
+    dag_id="log_cf_message_only_v2",
     default_args=default_args,
     description="Pull from cf-trigger-dag and print message body",
     schedule_interval=None,
@@ -31,7 +30,7 @@ with DAG(
         project_id=PROJECT_ID,
         subscription=SUBSCRIPTION_NAME,
         ack_messages=True,
-        messages_count=1,
+        max_messages=1,  # ✅ Correct param for v10.1.1
         timeout=60,
     )
 
