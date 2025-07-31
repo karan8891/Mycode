@@ -1,82 +1,32 @@
-from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.google.cloud.sensors.pubsub import PubSubPullSensor
 from airflow.providers.google.cloud.operators.cloud_storage_transfer_service import CloudDataTransferServiceCreateJobOperator
-
+from datetime import datetime, timedelta
 import json
-import base64
 
-PROJECT_ID = "sandbox-corp-gdw-sfr-cd8b"
+PROJECT_ID = "your-project-id"
 SUBSCRIPTION_NAME = "cf-trigger-dag"
+DEST_BUCKET = "destination-bucket-name"
 
 default_args = {
     "owner": "airflow",
     "depends_on_past": False,
-    "retries": 0,
-    "retry_delay": timedelta(minutes=1),
+    "retries": 1,
+    "retry_delay": timedelta(minutes=1)
 }
 
-
-def parse_cf_and_build_sts_body(**kwargs):
-    ti = kwargs["ti"]
-    messages = ti.xcom_pull(task_ids="wait_for_cf_message")
-
-    if not messages:
-        raise ValueError("No messages pulled from Pub/Sub.")
-
-    message = messages[0]
-    raw_data = message.get("message", {}).get("data", "")
-    if not raw_data:
-        raise ValueError("Message has no data field.")
-
-    decoded = base64.b64decode(raw_data).decode("utf-8")
-    parsed = json.loads(decoded)
-
-    print("✅ Decoded CF message:")
-    print(json.dumps(parsed, indent=2))
-
-    file_event = parsed["file_events"][0]
-    source_bucket = file_event["cdm_source_bucket"]
-    prefix = file_event["cdm_file_prefix_pattern"]
-    source_project_id = file_event["cdm_source_project_id"]
-    delete_source = file_event["delete_source_files_after_transfer"]
-
-    job_body = {
-        "description": "STS job from CF message",
-        "status": "ENABLED",
-        "projectId": PROJECT_ID,
-        "transferSpec": {
-            "gcsDataSource": {"bucketName": source_bucket},
-            "gcsDataSink": {"bucketName": "gdw2-sandbox-corp-gdw-sfr-cd8b"},
-            "objectConditions": {"includePrefixes": [prefix]},
-            "transferOptions": {"deleteObjectsFromSourceAfterTransfer": delete_source},
-        },
-        "schedule": {
-            "scheduleStartDate": {"year": 2025, "month": 7, "day": 31},
-            "scheduleEndDate": {"year": 2025, "month": 7, "day": 31},
-        },
-    }
-
-    ti.xcom_push(key="sts_job_body", value=job_body)
-
-
-def get_sts_body_from_xcom(**kwargs):
-    return kwargs["ti"].xcom_pull(task_ids="build_sts_body", key="sts_job_body")
-
-
 with DAG(
-    dag_id="Five9_to_CDM_Test",
+    dag_id="sts_cf_direct_inline_dag",
     default_args=default_args,
-    description="Parse CF message and print to logs",
+    start_date=datetime(2025, 7, 31),
     schedule_interval=None,
-    catchup=False,
-    start_date=datetime(2023, 1, 1),
-    tags=["cf", "sts", "apmf"],
+    catchup=False
 ) as dag:
 
-    wait_for_cf_message = PubSubPullSensor(
-        task_id="wait_for_cf_message",
+    # 1. Pull CF message
+    wait_for_cf = PubSubPullSensor(
+        task_id="wait_for_cf",
         project_id=PROJECT_ID,
         subscription=SUBSCRIPTION_NAME,
         ack_messages=True,
@@ -84,15 +34,58 @@ with DAG(
         timeout=60,
     )
 
-    build_sts_body = PythonOperator(
-        task_id="build_sts_body",
-        python_callable=parse_cf_and_build_sts_body,
+    # 2. Parse CF message and create STS job
+    def create_sts_job_from_cf_message(ti, **kwargs):
+        messages = ti.xcom_pull(task_ids="wait_for_cf", key="messages")
+        cf_message = json.loads(messages[0]['message']['data'])
+
+        source_bucket = cf_message['cdm_source_bucket']
+        prefix = cf_message['cdm_file_prefix_pattern']
+        delete_flag = cf_message['delete_source_files_after_transfer']
+
+        job_body = {
+            "description": "CF-triggered STS job",
+            "status": "ENABLED",
+            "projectId": PROJECT_ID,
+            "transferSpec": {
+                "gcsDataSource": {
+                    "bucketName": source_bucket
+                },
+                "gcsDataSink": {
+                    "bucketName": DEST_BUCKET
+                },
+                "objectConditions": {
+                    "includePrefixes": [prefix]
+                },
+                "transferOptions": {
+                    "deleteObjectsFromSourceAfterTransfer": delete_flag
+                }
+            },
+            "schedule": {
+                "scheduleStartDate": {
+                    "year": datetime.now().year,
+                    "month": datetime.now().month,
+                    "day": datetime.now().day
+                },
+                "scheduleEndDate": {
+                    "year": datetime.now().year,
+                    "month": datetime.now().month,
+                    "day": datetime.now().day
+                },
+                "startTimeOfDay": {
+                    "hours": datetime.now().hour,
+                    "minutes": datetime.now().minute + 1
+                }
+            }
+        }
+
+        from google.cloud import storage_transfer_v1
+        client = storage_transfer_v1.StorageTransferServiceClient()
+        client.create_transfer_job({"transferJob": job_body})
+
+    create_sts = PythonOperator(
+        task_id="create_sts_from_cf",
+        python_callable=create_sts_job_from_cf_message
     )
 
-    create_sts_job = CloudDataTransferServiceCreateJobOperator(
-        task_id="create_sts_job",
-        project_id=PROJECT_ID,
-        body=get_sts_body_from_xcom,
-    )
-
-    wait_for_cf_message >> build_sts_body >> create_sts_job
+    wait_for_cf >> create_sts
