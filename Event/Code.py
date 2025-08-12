@@ -1,241 +1,217 @@
 
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.providers.google.cloud.sensors.pubsub import PubSubPullSensor
-from datetime import timedelta, datetime
-import json, requests, os, uuid, time
-import google.auth
-from google.auth.transport.requests import Request as GAAuthRequest
-from google.cloud import storage
-from google.cloud import pubsub_v1
-import dummy_aws_base_hook  # keep so google provider import doesn’t break
+import os, json, time, uuid, base64
+from datetime import datetime
+from typing import List, Dict
 
-# ---------- helpers ----------
-def _conf(ti):
-    conf = ti.dag_run.conf or {}
-    required = ["project_id", "completion_subscription", "cdmnxt_topic", "sts_body", "job_name", "toc_files"]
-    miss = [k for k in required if k not in conf]
-    if miss:
-        raise ValueError(f"Missing in dag_run.conf: {miss}")
-    return conf
+from google.cloud import storage, pubsub_v1
+import google.auth
+from google.auth.transport.requests import Request
+import requests  # required for Composer REST call
+
+# ========= ENV (no hardcoding) =========
+PROJECT_ID              = os.getenv("PROJECT_ID")               # GDW project (for Pub/Sub etc.)
+COMPLETION_SUBSCRIPTION = os.getenv("COMPLETION_SUBSCRIPTION")  # projects/.../subscriptions/...
+CDMNXT_TOPIC            = os.getenv("CDMNXT_TOPIC")             # projects/.../topics/...
+DEST_BUCKET             = os.getenv("DEST_BUCKET")              # sink bucket for STS
+DEST_PATH               = os.getenv("DEST_PATH", "")            # sink path (can be empty)
+SOURCE_BUCKET           = os.getenv("SOURCE_BUCKET")            # source bucket for STS
+DELETE_AFTER_TRANSFER   = os.getenv("DELETE_AFTER_TRANSFER", "false").lower() == "true"
+NOTIFICATION_TOPIC_FQN  = os.getenv("NOTIFICATION_TOPIC_FQN")   # projects/.../topics/sts-completion-topic
+DAG_TRIGGER_URL         = os.getenv("DAG_TRIGGER_URL")          # e.g. https://<composer>/api/experimental/dags/<dag_id>/dag_runs
+
+BUFFER_SECONDS          = int(os.getenv("BUFFER_SECONDS", "0"))  # 0 = flush immediately (no batch)
+MAX_BATCH               = int(os.getenv("MAX_BATCH", "1"))       # cap batch size
+EVENT_FLUSH             = os.getenv("EVENT_FLUSH", "true").lower() == "true"  # event-based trigger now
+
+# ========= Clients =========
+storage_client = storage.Client()
+publisher = pubsub_v1.PublisherClient()
+
+# ========= In-memory buffer (best-effort) =========
+_BUFFER: List[Dict] = []
+_LAST_FLUSH = 0.0
+
+# ========= Helpers =========
+def _read_toc(toc_bucket: str, toc_name: str) -> Dict:
+    text = storage_client.bucket(toc_bucket).blob(toc_name).download_as_text()
+    return json.loads(text)
+
+def _validate_toc(toc: Dict):
+    required = ["cdm_process_id", "app_id", "cdm_object_mapping", "type", "businessProcessingDateTime"]
+    for k in required:
+        if k not in toc:
+            raise ValueError(f"TOC missing required key: {k}")
+    if not isinstance(toc.get("cdm_object_mapping"), list) or not toc["cdm_object_mapping"]:
+        raise ValueError("TOC.cdm_object_mapping must be non-empty list")
+
+def _collect_include_prefixes(tocs: List[Dict]) -> List[str]:
+    prefixes: List[str] = []
+    for t in tocs:
+        for o in t.get("cdm_object_mapping", []):
+            for i in o.get("dataobject", []):
+                name = i.get("name")
+                if name:
+                    prefixes.append(name)
+
+    # de-dup, preserve order
+    seen = set()
+    dedup = []
+    for p in prefixes:
+        if p not in seen:
+            seen.add(p)
+            dedup.append(p)
+    return dedup
+
+def _make_unique_job_name() -> str:
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    return f"event_sts_job_{ts}_{uuid.uuid4().hex[:8]}"
+
+def _build_sts_body(include_prefixes: List[str], job_name: str) -> Dict:
+    """
+    Build STS job body using only ENV variables + collected prefixes.
+    """
+    return {
+        "transferJob": {
+            "name": job_name,  # unique name per run (helps correlate completion)
+            "description": f"Event STS job {job_name}",
+            "status": "ENABLED",
+            "transferSpec": {
+                "gcsDataSource": {"bucketName": SOURCE_BUCKET},
+                "gcsDataSink": {"bucketName": DEST_BUCKET, "path": DEST_PATH},
+                "objectConditions": {"includePrefixes": include_prefixes},
+                "transferOptions": {
+                    "overwriteObjectsAlreadyExistingInSink": True,
+                    "deleteObjectsFromSourceAfterTransfer": DELETE_AFTER_TRANSFER,
+                },
+            },
+            "notificationConfig": {
+                "pubsubTopic": NOTIFICATION_TOPIC_FQN,  # FQN required
+                "eventTypes": ["TRANSFER_OPERATION_SUCCESS", "TRANSFER_OPERATION_FAILED"],
+                "payloadFormat": "JSON",
+            },
+        }
+    }
 
 def _access_token() -> str:
+    """Normal OAuth access token; works for Composer webserver if not IAP-protected."""
     creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
     if not creds.valid:
-        creds.refresh(GAAuthRequest())
+        creds.refresh(Request())
     return creds.token
 
-def _normalize_path(*parts: str) -> str:
-    return "/".join(s.strip("/") for s in parts if s).strip("/")
-
-def _find_missing_in_dest(sts_body: dict) -> list[str]:
-    """Compare includePrefixes against sink; return those not present."""
-    spec = sts_body["transferJob"]["transferSpec"]
-    dest_bucket = spec["gcsDataSink"]["bucketName"]
-    dest_path   = spec["gcsDataSink"].get("path", "")
-    prefixes    = spec["objectConditions"].get("includePrefixes", [])
-    client = storage.Client()
-    bucket = client.bucket(dest_bucket)
-
-    missing: list[str] = []
-    for p in prefixes:
-        dest_obj = _normalize_path(dest_path, p) if dest_path else p
-        if not bucket.blob(dest_obj).exists():
-            missing.append(p)
-    return missing
-
-def _wait_for_job_completion_sync(subscription_fqn: str, job_name: str,
-                                  timeout_sec: int = 30*60, batch: int = 10, sleep_s: int = 20):
-    """Block until we see a Pub/Sub notification for the specific job_name."""
-    sub = pubsub_v1.SubscriberClient()
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        resp = sub.pull(request={"subscription": subscription_fqn, "max_messages": batch}, timeout=10)
-        ack_ids = []
-        for rm in resp.received_messages:
-            try:
-                payload = json.loads(rm.message.data.decode("utf-8"))
-                job = payload.get("jobName", "")
-                if job.endswith(job_name) or job == job_name:
-                    ack_ids.append(rm.ack_id)
-            except Exception:
-                pass  # ignore junk
-        if ack_ids:
-            sub.acknowledge(request={"subscription": subscription_fqn, "ack_ids": ack_ids})
-            return
-        time.sleep(sleep_s)
-    raise RuntimeError("Timed out waiting for restarted STS job completion")
-
-def _restart_missing_job_sync(**kwargs):
+def _trigger_airflow_dag(conf: Dict, dag_run_id: str):
     """
-    After the first STS run finished, check destination for gaps.
-    If any includePrefixes are missing, submit a new STS job with only the missing ones
-    and wait for its completion.
+    Calls Composer experimental endpoint:
+      POST {DAG_TRIGGER_URL}
+      Body: {"conf": {...}} (optionally include run_id; most envs ignore/allow)
     """
-    ti = kwargs["ti"]
-    conf = _conf(ti)
-    body = conf["sts_body"]
-    completion_sub = conf["completion_subscription"]
+    if not DAG_TRIGGER_URL:
+        raise RuntimeError("DAG_TRIGGER_URL env var not set")
 
-    missing = _find_missing_in_dest(body)
-    if not missing:
-        print("No missing files detected; no restart needed.")
-        ti.xcom_push(key="restarted", value=False)
-        return
-
-    # clone and narrow includePrefixes
-    from copy import deepcopy
-    new_body = deepcopy(body)
-    job = new_body["transferJob"]
-    spec = job["transferSpec"]
-    if "objectConditions" not in spec:
-        spec["objectConditions"] = {}
-    spec["objectConditions"]["includePrefixes"] = missing
-
-    # unique retry job name
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    job["name"] = f'{conf["job_name"]}_retry_{ts}_{uuid.uuid4().hex[:6]}'
-
-    # ensure notifications (FQN)
-    if "notificationConfig" not in job and os.getenv("NOTIFICATION_TOPIC_FQN"):
-        job["notificationConfig"] = {
-            "pubsubTopic": os.getenv("NOTIFICATION_TOPIC_FQN"),
-            "eventTypes": ["TRANSFER_OPERATION_SUCCESS", "TRANSFER_OPERATION_FAILED"],
-            "payloadFormat": "JSON",
-        }
-
-    # create via REST
-    url = "https://storagetransfer.googleapis.com/v1/transferJobs"
     headers = {
         "Authorization": f"Bearer {_access_token()}",
         "Content-Type": "application/json",
-        "X-Goog-User-Project": conf["project_id"],
     }
-    resp = requests.post(url, headers=headers, json=new_body, timeout=60)
-    if resp.status_code not in (200, 201, 409):
-        raise RuntimeError(f"STS restart failed: {resp.status_code} {resp.text}")
 
-    print(f"Restarted STS for {len(missing)} missing object(s); job: {job['name']}")
+    # most experimental endpoints expect only {"conf": {...}}
+    body = {"conf": conf}
+    body["run_id"] = dag_run_id  # harmless if ignored
 
-    _wait_for_job_completion_sync(completion_sub, job["name"])
+    host = requests.utils.urlparse(DAG_TRIGGER_URL).netloc
+    print(f"[CF] Trigger DAG: run_id={dag_run_id}")
+    print(f"[CF] Trigger URL host: {host}")
+    print(f"[CF] Conf keys: {list(conf.keys())}")
 
-    ti.xcom_push(key="restarted", value=True)
-    ti.xcom_push(key="restart_job_name", value=job["name"])
+    resp = requests.post(DAG_TRIGGER_URL, headers=headers, json=body, timeout=60)
+    print(f"[CF] Trigger HTTP {resp.status_code} | {resp.text[:300]}")
+    if resp.status_code not in (200, 201, 202):
+        raise RuntimeError(f"Airflow trigger failed: {resp.status_code} {resp.text}")
 
-# ---------- part 1: create job ----------
-def _create_sts_job(**kwargs):
+def _flush(batch_events: List[Dict]):
     """
-    Part 1 (single task): pull all values, build/validate transfer spec,
-    and create the STS job via REST.
+    Process a buffered batch: read all TOCs, build a single STS body with includePrefixes, trigger the DAG.
     """
-    ti = kwargs["ti"]
-    conf = _conf(ti)
+    tocs: List[Dict] = []
+    toc_pointers: List[Dict] = []
 
-    project_id = conf["project_id"]
-    job_name   = conf["job_name"]
-    body       = conf["sts_body"]         # already assembled by CF
+    print(f"[CF] Building DAG conf from {len(batch_events)} event(s)")
+    for ev in batch_events[:MAX_BATCH]:
+        print(f"[CF]  pointer: toc_bucket={ev['toc_bucket']} toc_name={ev['toc_name']}")
+        toc_bucket = ev["toc_bucket"]
+        toc_name = ev["toc_name"]
+        toc = _read_toc(toc_bucket, toc_name)
+        _validate_toc(toc)
+        tocs.append(toc)
+        toc_pointers.append({"toc_bucket": toc_bucket, "toc_name": toc_name})
 
-    # light validation
-    if "transferJob" not in body or "transferSpec" not in body["transferJob"]:
-        raise ValueError("sts_body must contain transferJob.transferSpec")
+    include_prefixes = _collect_include_prefixes(tocs)
+    job_name = _make_unique_job_name()
+    sts_body = _build_sts_body(include_prefixes, job_name)
 
-    # force unique name we’ll correlate on
-    body["transferJob"]["name"] = job_name
-
-    url = "https://storagetransfer.googleapis.com/v1/transferJobs"
-    headers = {
-        "Authorization": f"Bearer {_access_token()}",
-        "Content-Type": "application/json",
-        "X-Goog-User-Project": project_id,
+    dag_run_id = f"sts_run_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:6]}"
+    conf = {
+        "project_id": PROJECT_ID,
+        "completion_subscription": COMPLETION_SUBSCRIPTION,
+        "cdmnxt_topic": CDMNXT_TOPIC,
+        "job_name": job_name,
+        "sts_body": sts_body,
+        # pass only pointers; DAG will read actual TOC JSON from GCS:
+        "toc_files": toc_pointers,
     }
-    resp = requests.post(url, headers=headers, json=body, timeout=60)
-    if resp.status_code not in (200, 201, 409):  # 409 = already exists (idempotent)
-        raise RuntimeError(f"STS create failed: {resp.status_code} {resp.text}")
 
-    # xcom for downstream tasks
-    ti.xcom_push(key="job_name", value=job_name)
-    ti.xcom_push(key="project_id", value=project_id)
-    ti.xcom_push(key="completion_subscription", value=conf["completion_subscription"])
-    ti.xcom_push(key="cdmnxt_topic", value=conf["cdmnxt_topic"])
-    ti.xcom_push(key="toc_files", value=conf["toc_files"])
-    print(f"STS job created (or already existed): {job_name}")
-
-# ---------- sensor filter ----------
-def _messages_filter_callback(messages, context):
-    """Ack only messages whose payload jobName endswith our job_name."""
-    ti = context["ti"]
-    job_name = ti.xcom_pull(task_ids="create_sts_job", key="job_name")
-    matched = []
-    for m in messages:
-        try:
-            payload = json.loads(m["message"]["data"])
-            job = payload.get("jobName", "")
-            if job.endswith(job_name) or job == job_name:
-                matched.append(m)
-        except Exception:
-            continue
-    return matched
-
-# ---------- part 3: publish TOCs ----------
-def _publish_tocs_to_cdmnxt(**kwargs):
-    ti = kwargs["ti"]
-    project_id = ti.xcom_pull(task_ids="create_sts_job", key="project_id")
-    topic_fqn  = ti.xcom_pull(task_ids="create_sts_job", key="cdmnxt_topic")
-    toc_files  = ti.xcom_pull(task_ids="create_sts_job", key="toc_files")
-
-    pub = pubsub_v1.PublisherClient()
-    topic_path = topic_fqn if topic_fqn.startswith("projects/") else pub.topic_path(project_id, topic_fqn)
-
-    storage_client = storage.Client()
-    for p in toc_files:
-        text = storage_client.bucket(p["toc_bucket"]).blob(p["toc_name"]).download_as_text()
-        pub.publish(topic_path, text.encode("utf-8")).result()
-    print(f"Published {len(toc_files)} TOC JSONs to {topic_path}")
-
-# ---------- DAG ----------
-default_args = {"owner": "airflow", "retries": 1, "retry_delay": timedelta(minutes=1)}
-
-with DAG(
-    dag_id="event_sts_transfer_dag",
-    default_args=default_args,
-    start_date=datetime(2024, 1, 1),
-    schedule_interval=None,
-    catchup=False,
-    max_active_runs=10,
-    tags=["sts", "gdw", "event"],
-) as dag:
-
-    # Part 1
-    create_sts_job = PythonOperator(
-        task_id="create_sts_job",
-        python_callable=_create_sts_job,
-        provide_context=True,
+    print(
+        f"[CF] Flush: job_name={job_name}, prefixes={len(include_prefixes)}, "
+        f"tocs={len(toc_pointers)}, run={dag_run_id}"
     )
+    _trigger_airflow_dag(conf, dag_run_id)
 
-    # Part 2
-    wait_for_sts_completion = PubSubPullSensor(
-        task_id="wait_for_sts_completion",
-        project_id="{{ ti.xcom_pull(task_ids='create_sts_job', key='project_id') }}",
-        subscription="{{ ti.xcom_pull(task_ids='create_sts_job', key='completion_subscription') }}",
-        ack_messages=True,
-        messages_callback=_messages_filter_callback,
-        timeout=60*30,
-        poke_interval=20,
-        max_messages=10,
-    )
+# ======= CFv1 entrypoint =======
+def main(event, context):
+    """
+    Trigger: Pub/Sub (message from APMF CF)
+    Expected message body (JSON):
+      {
+        "bucket": "<original bucket>",
+        "name": "<original object>",
+        "toc_bucket": "<bucket storing .toc>",
+        "toc_name": "<path/to/file.toc>"
+      }
+    """
+    global _LAST_FLUSH, _BUFFER
 
-    # Optional: restart missing files
-    restart_missing_if_needed = PythonOperator(
-        task_id="restart_missing_if_needed",
-        python_callable=_restart_missing_job_sync,
-        provide_context=True,
-    )
+    # Pub/Sub envelope
+    if "data" in event:
+        msg = json.loads(base64.b64decode(event["data"]).decode("utf-8"))
+    else:
+        msg = event  # direct call (tests)
 
-    # Part 3
-    publish_toc_to_cdmnxt = PythonOperator(
-        task_id="publish_toc_to_cdmnxt",
-        python_callable=_publish_tocs_to_cdmnxt,
-        provide_context=True,
-    )
+    print("[CF] Received Pub/Sub message:", msg)
 
-    create_sts_job >> wait_for_sts_completion >> restart_missing_if_needed >> publish_toc_to_cdmnxt
+    # Validate required fields from APMF pointer
+    for k in ("toc_bucket", "toc_name"):
+        if k not in msg:
+            raise ValueError(f"Missing '{k}' in message")
+
+    # Always append to buffer (keep batching semantics)
+    _BUFFER.append({"toc_bucket": msg["toc_bucket"], "toc_name": msg["toc_name"]})
+    now = time.time()
+    if _LAST_FLUSH == 0:
+        _LAST_FLUSH = now
+
+    if EVENT_FLUSH:
+        # Event-based (immediate) single flush
+        print("[CF] EVENT_FLUSH is enabled → triggering DAG immediately for this one message")
+        _flush([{"toc_bucket": msg["toc_bucket"], "toc_name": msg["toc_name"]}])
+    else:
+        # Original batching behavior
+        if BUFFER_SECONDS == 0 or (now - _LAST_FLUSH) >= BUFFER_SECONDS:
+            batch = _BUFFER
+            _BUFFER = []
+            _LAST_FLUSH = now
+            if batch:
+                _flush(batch)
+            else:
+                print("[CF] Flush: buffer empty; nothing to do.")
+        else:
+            wait_s = int(BUFFER_SECONDS - (now - _LAST_FLUSH))
+            print(f"[CF] Buffered: size={len(_BUFFER)}; next flush in {wait_s}s")
