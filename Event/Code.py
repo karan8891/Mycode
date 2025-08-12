@@ -1,11 +1,9 @@
-from datetime import datetime, timedelta
-
-now = datetime.utcnow()
-start = now - timedelta(minutes=2)   # ensure window already opened
-end   = now + timedelta(days=1)      # or use start for one-shot
-
-body["transferJob"]["schedule"] = {
-    "scheduleStartDate": {"year": start.year, "month": start.month, "day": start.day},
-    "startTimeOfDay":    {"hours": start.hour, "minutes": start.minute},
-    "scheduleEndDate":   {"year": end.year,   "month": end.month,   "day": end.day},
+# --- right after successful create 
+run_url = "https://storagetransfer.googleapis.com/v1/transferJobs:run"
+run_body = {
+    "projectId": project_id,
+    "jobName": body["transferJob"]["name"],  # "transferJobs/<id>"
 }
+run_resp = requests.post(run_url, headers=headers, json=run_body, timeout=60)
+if run_resp.status_code not in (200, 204):
+    raise RuntimeError(f"STS run failed: {run_resp.status_code} {run_resp.text}")
