@@ -1,0 +1,62 @@
+Here are Slide 9 pointers you can directly add to your deck for Logging & Monitoring STS Jobs:
+
+
+---
+
+Slide 9: Logging & Monitoring Tips
+
+Cloud Logging
+
+STS automatically writes transfer job logs to Cloud Logging.
+
+Filter logs by resource.type=storagetransfer_job to see details.
+
+
+Airflow Task Logging
+
+Use logging.info() in DAG tasks to record job name, run_id, and status.
+
+Prefer structured JSON logs for easier parsing and alerts.
+
+
+Pub/Sub Notifications
+
+Configure notificationConfig in STS job to push SUCCESS/FAILURE events.
+
+Subscribe Airflow DAGs or Cloud Functions to capture and react.
+
+
+Airflow Sensors
+
+Use CloudDataTransferServiceJobStatusSensor to wait for completion.
+
+Automatically retries or fails DAG based on STS outcome.
+
+
+XComs for Traceability
+
+Push job details (job_name, operation_id, status) to XCom.
+
+Downstream tasks can use these for reporting or conditional branching.
+
+
+Monitoring Dashboards
+
+Export metrics (bytes transferred, job failures) to Cloud Monitoring.
+
+Build dashboards and alerts for visibility of job health.
+
+
+Error Handling
+
+Wrap STS operators with try/except → log exceptions to Cloud Logging.
+
+Set Airflow retries & alerting policies (Slack, Email).
+
+
+
+
+---
+
+👉 Do you want me to also give you a compact DAG code snippet (ready for Slide 9) that shows logging, Pub/Sub notificationConfig, and JobStatusSensor all in one flow? That would make this slide even stronger.
+
