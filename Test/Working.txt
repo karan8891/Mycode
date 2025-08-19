@@ -1,0 +1,63 @@
+Here’s the quick, no-fluff rundown.
+
+CF2 (orchestrator / mock of DAG1–3)
+
+Trigger: Pub/Sub topic that CF1 publishes to.
+
+Reads: CF1 message → grabs sparkflow_parms and cdm_object_mapping[0].
+
+Validates/loads: From SOR bucket it opens:
+
+<object>_sor_config_file.json
+
+<object>_sor_db_conn.json
+
+
+Extracts: Source details (DB type/name/table/query) + connection bits (driver/user/JCEKS/URL).
+
+Mocks DAGs: Creates three JSON status files:
+
+dag1_ingest.json (pretend RAW land)
+
+dag2_quality.json (mock checks)
+
+dag3_publish.json (pretend curate/publish)
+
+
+Writes: All artifacts under
+runs/<cdm_process_id>/<object_name>/ in the same SOR bucket, plus a verification.json with parsed summaries.
+
+Optional: If NEXT_TOPIC is set (or hardcoded), publishes a small summary (with run_root) to CF3’s topic.
+
+No BQ writes (per your instruction).
+
+
+CF3 (completion / audit sink)
+
+Trigger: Pub/Sub topic that CF2 publishes to (the NEXT_TOPIC one).
+
+Reads: CF2 summary (ideally includes run_root and sor_bucket).
+
+Verifies: Checks that the four files exist in the SOR bucket path:
+
+verification.json, dag1_ingest.json, dag2_quality.json, dag3_publish.json
+
+
+Writes: A final cf3_done.json with COMPLETE (all present) or PARTIAL (some missing).
+
+BigQuery audit: Adds 3 rows (CF2 unchanged):
+
+1. CF3_RECEIVED — when message arrives
+
+
+2. CF3_VERIFIED — after checking which files are present/missing
+
+
+3. CF3_DONE — after writing cf3_done.json (status = COMPLETE/PARTIAL)
+(Enabled when BQ_AUDIT_DATASET + BQ_AUDIT_TABLE env vars are set; otherwise it skips gracefully.)
+
+
+
+
+That’s it: CF2 validates and mocks, CF3 verifies and finalizes—with your 3 BQ entries handled entirely in CF3.
+
